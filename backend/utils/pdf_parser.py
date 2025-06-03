@@ -1,93 +1,232 @@
 import os
-import pdfplumber
+import re
 import json
-from typing import List, Dict
+import pdfplumber
+from typing import Dict, List
 from dotenv import load_dotenv
 from openai import OpenAI
+import nltk
+from nltk import sent_tokenize
 
-# 🔐 Load OpenAI API key from .env
+nltk.download('punkt')
+nltk.download('punkt_tab')
+
+# Load API Key
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
 if not OPENAI_API_KEY:
-    raise ValueError("❌ OPENAI_API_KEY가 .env에서 불러와지지 않았습니다!")
-
+    raise ValueError("OPENAI_API_KEY missing in .env")
 client = OpenAI(api_key=OPENAI_API_KEY)
 
+# 문장 기반 의미 단위 chunking
+def semantic_chunking(text: str, max_chars: int = 6000) -> List[str]:
+    sentences = sent_tokenize(text)
+    chunks, current_chunk = [], ""
 
-def extract_title_and_references_via_llm(pdf_path: str, model_name="gpt-4") -> Dict[str, object]:
-    full_text = ""
-    with pdfplumber.open(pdf_path) as pdf:
-        for page in pdf.pages:
-            text = page.extract_text()
-            if text:
-                full_text += text + "\n"
+    for sent in sentences:
+        if len(current_chunk) + len(sent) + 1 < max_chars:
+            current_chunk += " " + sent
+        else:
+            chunks.append(current_chunk.strip())
+            current_chunk = sent
+    if current_chunk:
+        chunks.append(current_chunk.strip())
+
+    return chunks
+
+# 텍스트 블록 추출 함수
+def extract_text_blocks(text: str) -> Dict[str, str]:
+    # abstract와 references의 위치 찾기
+    abstract_match = re.search(r'\babstract\b', text, re.IGNORECASE)
+    ref_match = re.search(r'\n\s*(references|bibliography)\s*\n', text, re.IGNORECASE)
+
+    # introduction 키워드 또는 목차 번호 패턴으로 abstract 끝 추정
+    intro_patterns = [
+        r'\n\s*(1|Ⅰ|I)\.?\s*(introduction)?\s*\n',
+        r'\n\s*introduction\s*\n'
+    ]
+    end_abstract = None
+    for pattern in intro_patterns:
+        intro_match = re.search(pattern, text[abstract_match.end():], re.IGNORECASE) if abstract_match else None
+        if intro_match:
+            end_abstract = abstract_match.end() + intro_match.start()
+            break
+    if not end_abstract:
+        end_abstract = abstract_match.end() if abstract_match else 0
+
+    # reference 시작 지점
+    start_refs = ref_match.start() if ref_match else len(text)
+
+    # reference 이후 appendix 등으로 끊는 구간
+    postfix_patterns = [
+        r'\n\s*(appendix|supplementary|acknowledg(e)?ments|about the author|biography)\b'
+    ]
+    end_refs = len(text)
+    for pattern in postfix_patterns:
+        match = re.search(pattern, text[start_refs:], re.IGNORECASE)
+        if match:
+            end_refs = start_refs + match.start()
+            break
+
+    # block들 정의
+    block1 = text[:end_abstract].strip()
+    block2 = text[end_abstract:start_refs].strip()
+    block3 = text[start_refs:end_refs].strip()
+    block4 = text[end_refs:].strip() if end_refs < len(text) else ""
+
+    return {
+        "block1": block1,
+        "block2": block2,
+        "block3": block3,
+        "block4": block4
+    }
+
+# LLM 호출 (1단계)
+def call_llm_step1(block1: str, block3: str, model="gpt-4"):
+    # 🔍 block3에서 가장 큰 reference 번호 추정
+    ref_numbers = re.findall(r"\[(\d+)\]", block3)
+    max_ref_num = max(map(int, ref_numbers)) if ref_numbers else 0
 
     prompt = f"""
-다음은 하나의 논문에서 추출한 전체 텍스트입니다. 이 텍스트를 바탕으로 아래 두 가지 정보를 JSON 형식으로 정리해줘.
+[논문 정보 일부]
+- 논문 초반부 (제목/저자/abstract 포함): {block1}
+- Reference 섹션 전체: {block3}
 
-1. 논문 제목: 논문 본문에서 유추 가능한 가장 정확한 제목 (ex. 첫 페이지 맨 위나 제목 형식의 큰 글씨 등에서 추정)
-2. 참고문헌 목록: "References" 또는 "참고문헌" 섹션에 나오는 각 레퍼런스를 아래 형식으로 리스트로 정리
+[당신의 임무]
+1. 논문 제목(title)을 간결하게 정제하세요.
+2. abstract 내용은 수정하지 말고, 띄어쓰기와 문장 부호, 대소문자, 오탈자만 교정하여 abstract_original로 출력하세요. 절대 요약하거나 의미를 바꾸지 마세요.
+3. reference section에서 [1], [2], ... 형식의 reference 번호별로 각 논문의 제목만 추정해 출력하세요.
 
-출력 형식 예시는 다음과 같아:
+⚠️ 유의사항:
+- reference는 총 {max_ref_num}개여야 합니다. 즉, [1]부터 [{max_ref_num}]까지의 ref_number를 모두 포함해야 합니다.
+- 각 reference는 다음과 같은 형식으로 출력하세요:
+  {{
+    "ref_number": "[1]",
+    "ref_title": "..."
+  }}
+
+📌 출력은 반드시 JSON 형식으로만 출력하세요. 설명, 주석, 여는 말 없이 JSON만 출력해야 합니다.
+
+[출력 형식 예시]
 {{
-  "title": "논문 제목",
+  "title": "...",
+  "abstract_original": "...",
   "references": [
     {{
-      "제목": "각 레퍼런스의 논문 제목 (있다면)",
-      "참조내용": "원문에서 발췌한 전체 참고문헌 문장"
+      "ref_number": "[1]",
+      "ref_title": "..."
     }},
     ...
   ]
 }}
-
-주의:
-- 레퍼런스 개별 항목들은 줄바꿈이나 번호로 구분되는 것들만 포함
-- 제목이 없는 경우 "제목 없음"으로 둬도 괜찮아
-- 출력은 반드시 위 JSON 형식을 따라야 해
-
-다음은 논문 텍스트입니다:
------------------------------
-{full_text[-10000:]}
 """
-
     response = client.chat.completions.create(
-        model=model_name,
+        model=model,
         messages=[{"role": "user", "content": prompt}],
-        temperature=0.2
+        temperature=0
     )
+    return json.loads(response.choices[0].message.content.strip())
 
-    try:
-        parsed = json.loads(response.choices[0].message.content.strip())
-        return parsed
-    except Exception as e:
-        print("❌ LLM 응답 파싱 실패:", e)
-        print("🔎 원본 응답:\n", response.choices[0].message.content)
-        return {"title": "", "references": []}
+# LLM 호출 (2단계 chunk별)
+def call_llm_step2_chunk(chunk: str, model="gpt-4") -> Dict:
+    prompt = f"""
+[논문 본문 일부 chunk]
+{chunk}
 
+[당신의 임무]
+1. citation_contexts는 [1], [2], ... 형식의 reference 번호가 포함된 문장만 추출하여, 해당 번호별로 리스트로 구성하세요.
+2. citation_contexts에는 반드시 하나 이상의 문장이 있어야 합니다. 빈 리스트가 되면 안 됩니다. (예: "[3]": ["..."])
+3. body_fixed는 본문 내용을 그대로 유지하되, 띄어쓰기, 구두점, 대소문자, 오탈자만 교정하세요. 절대 의미를 바꾸지 마세요.
 
-def save_extracted_info(pdf_path: str, extracted: Dict[str, object]):
-    base_path = pdf_path.replace(".pdf", "")
-    
-    # 제목 저장
-    title_path = base_path + "_title.txt"
-    with open(title_path, "w", encoding="utf-8") as f:
-        f.write(extracted.get("title", "제목 없음"))
-    print(f"📄 논문 제목 저장 완료: {title_path}")
-    
-    # 참고문헌 저장
-    refs_path = base_path + "_refs.txt"
-    with open(refs_path, "w", encoding="utf-8") as f:
-        for i, ref in enumerate(extracted.get("references", []), start=1):
-            f.write(f"[{i}] 제목: {ref['제목']}\n참조내용: {ref['참조내용']}\n\n")
-    print(f"📚 레퍼런스 {len(extracted.get('references', []))}개 저장 완료: {refs_path}")
+⚠️ 반드시 JSON 형식으로만 출력하세요. 설명, 주석, 여는 말 없이 JSON만 출력해야 합니다.
 
+[출력 형식 예시]
+{{
+  "body_fixed": "...",
+  "citation_contexts": {{
+    "[1]": ["..."],
+    "[2]": ["..."]
+  }}
+}}
+"""
+    response = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0
+    )
+    return json.loads(response.choices[0].message.content.strip())
+
+# 메타데이터 병합 및 저장
+def merge_and_save(step1_result, abstract_llm: str, body_fixed_chunks: List[str], citation_contexts: Dict[str, List[str]], pdf_path: str, out_path: str):
+    for ref in step1_result.get("references", []):
+        ref_number = ref.get("ref_number")
+        ref["citation_contexts"] = citation_contexts.get(ref_number, [])
+
+    final_metadata = {
+        "title": step1_result.get("title", ""),
+        "abstract_original": step1_result.get("abstract_original", ""),
+        "abstract_llm": abstract_llm,
+        "body_fixed": "\n\n".join(body_fixed_chunks),
+        "references": step1_result.get("references", [])
+    }
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(final_metadata, f, indent=2, ensure_ascii=False)
+    print(f"✅ 메타데이터 저장 완료: {out_path}")
+
+# 전체 실행 함수
+def process_pdf(pdf_path: str, out_path: str):
+    print(f"\n📂 PDF 처리 시작: {pdf_path}")
+
+    # ✅ 기존 출력 파일이 존재하면 해당 파일 로드하여 반환
+    if os.path.exists(out_path):
+        print(f"⚠️ 이미 메타데이터 파일 존재: {out_path} → 기존 파일 사용")
+        with open(out_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    with pdfplumber.open(pdf_path) as pdf:
+        full_text = "\n\n".join(page.extract_text() for page in pdf.pages if page.extract_text())
+
+    blocks = extract_text_blocks(full_text)
+
+    print("🚀 1단계 LLM 호출 중...")
+    step1_result = call_llm_step1(blocks["block1"], blocks["block3"])
+
+    print("🧠 요약용 abstract_llm 생성 중...")
+    abstract_llm_prompt = f"""다음은 논문 본문입니다. 핵심 내용을 2~3문장으로 요약하세요:
+{blocks['block2']}"""
+    abstract_llm = client.chat.completions.create(
+        model="gpt-4",
+        messages=[{"role": "user", "content": abstract_llm_prompt}],
+        temperature=0
+    ).choices[0].message.content.strip()
+
+    print("🚀 2단계 LLM 반복 호출 중...")
+    chunks = semantic_chunking(blocks["block2"] + "\n" + blocks["block4"])
+
+    body_fixed_chunks = []
+    citation_contexts = {}
+    for idx, chunk in enumerate(chunks):
+        print(f"  🔍 Chunk {idx+1}/{len(chunks)} 처리 중...")
+        result = call_llm_step2_chunk(chunk)
+        body_fixed_chunks.append(result.get("body_fixed", ""))
+        for ref, ctxs in result.get("citation_contexts", {}).items():
+            citation_contexts.setdefault(ref, []).extend(ctxs)
+
+    final_metadata = {
+        "title": step1_result.get("title", ""),
+        "abstract_original": step1_result.get("abstract_original", ""),
+        "abstract_llm": abstract_llm,
+        "body_fixed": "\n\n".join(body_fixed_chunks),
+        "references": step1_result.get("references", [])
+    }
+
+    # 메타데이터 저장
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(final_metadata, f, indent=2, ensure_ascii=False)
+    print(f"✅ 메타데이터 저장 완료: {out_path}")
+
+    return final_metadata
 
 if __name__ == "__main__":
-    pdf_file = "transformer.pdf"
-    result = extract_title_and_references_via_llm(pdf_file)
-
-    print("\n🎯 논문 제목:", result.get("title", "없음"))
-    print("📚 레퍼런스 개수:", len(result.get("references", [])))
-    
-    save_extracted_info(pdf_file, result)
+    process_pdf("transformer.pdf", "transformer_metadata.json")
