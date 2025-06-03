@@ -89,40 +89,45 @@ export default function PDFViewer({ pdfFile, isVisible, onCitationClick }: PDFVi
         const text = htmlElement.textContent || '';
         
         // [숫자] 또는 [숫자, 숫자] 패턴 찾기
-        const citationMatch = text.match(/\[(\d+(?:,\s*\d+)*)\]/);
+        const citationMatches = text.match(/\[(\d+(?:,\s*\d+)*)\]/g);
         
-        if (citationMatch) {
+        if (citationMatches) {
           citationCount++;
-          const numbers = citationMatch[1].split(',').map(n => parseInt(n.trim()));
           
-          console.log('인용 번호 발견:', citationMatch[0], '→', numbers);
-          
-          // 요소를 클릭 가능하게 만들기
-          htmlElement.style.color = '#4f46e5';
-          htmlElement.style.cursor = 'pointer';
-          htmlElement.style.textDecoration = 'underline';
-          htmlElement.style.fontWeight = 'bold';
-          htmlElement.style.borderRadius = '2px';
-          htmlElement.style.padding = '1px 2px';
-          
-          htmlElement.addEventListener('click', (e) => {
-            e.preventDefault();
-            e.stopPropagation();
+          // 각 인용 번호를 개별적으로 처리
+          citationMatches.forEach(citation => {
+            const numbers = citation.slice(1, -1).split(',').map(n => parseInt(n.trim()));
             
-            // 첫 번째 인용 번호 클릭 이벤트 발생
-            if (numbers.length > 0) {
-              onCitationClick(numbers[0]);
-              console.log(`✅ 인용 번호 ${numbers[0]} 클릭됨!`);
-            }
-          });
+            console.log('인용 번호 발견:', citation, '→', numbers);
+            
+            // 요소를 클릭 가능하게 만들기
+            htmlElement.style.color = '#4f46e5';
+            htmlElement.style.cursor = 'pointer';
+            htmlElement.style.textDecoration = 'underline';
+            htmlElement.style.fontWeight = 'bold';
+            htmlElement.style.borderRadius = '2px';
+            htmlElement.style.padding = '1px 2px';
+            
+            // 클릭 이벤트 리스너 추가
+            htmlElement.addEventListener('click', (e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              
+              // 첫 번째 인용 번호 클릭 이벤트 발생
+              if (numbers.length > 0) {
+                onCitationClick(numbers[0]);
+                console.log(`✅ 인용 번호 ${numbers[0]} 클릭됨!`);
+              }
+            });
 
-          // 호버 효과
-          htmlElement.addEventListener('mouseenter', () => {
-            htmlElement.style.backgroundColor = 'rgba(79, 70, 229, 0.1)';
-          });
-          
-          htmlElement.addEventListener('mouseleave', () => {
-            htmlElement.style.backgroundColor = 'transparent';
+            // 호버 효과
+            htmlElement.addEventListener('mouseenter', () => {
+              htmlElement.style.backgroundColor = 'rgba(79, 70, 229, 0.1)';
+            });
+            
+            htmlElement.addEventListener('mouseleave', () => {
+              htmlElement.style.backgroundColor = 'transparent';
+            });
           });
         }
       });
